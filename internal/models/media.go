@@ -66,6 +66,7 @@ type Episode struct {
 	SkipTimes SkipTimes
 	DataID    string // Used for FlixHQ episode identification
 	SeasonID  string // Season identifier for TV shows
+	// Watched   bool   // Mark episode as watched/unwatched
 }
 
 // TitleDetails contains title information in multiple languages

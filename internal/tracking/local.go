@@ -58,12 +58,23 @@ type Anime struct {
 	LastUpdated   time.Time `json:"last_updated"`
 }
 
+// The EpisodeTracking struct represents tracked episodes. It contains information about the episode's status, such as whether it has been watched or not.
+type EpisodeTracking struct {
+	AllanimeID    string    `json:"allanime_id"`
+	EpisodeNumber int       `json:"episode_number"`
+	Watched       bool      `json:"watched"`
+	MediaType     string    `json:"media_type"` // "anime" or "movie"
+	LastUpdated   time.Time `json:"last_updated"`
+}
+
 type LocalTracker struct {
-	db       *sql.DB
-	upsertPS *sql.Stmt
-	getPS    *sql.Stmt
-	allPS    *sql.Stmt
-	deletePS *sql.Stmt
+	db              *sql.DB
+	upsertPS        *sql.Stmt
+	getPS           *sql.Stmt
+	allPS           *sql.Stmt
+	deletePS        *sql.Stmt
+	upsertEpisodePS *sql.Stmt
+	getEpisodePS    *sql.Stmt
 }
 
 /*
@@ -213,17 +224,30 @@ func initializeDatabase(db *sql.DB) error {
 		last_updated   INTEGER NOT NULL
 	);`
 
+	episodeSchema := `CREATE TABLE IF NOT EXISTS episode_tracking (
+		allanime_id    TEXT    NOT NULL,
+		episode_number INTEGER NOT NULL,
+		watched        BOOLEAN NOT NULL DEFAULT FALSE,
+		media_type     TEXT    DEFAULT 'anime',
+		last_updated   INTEGER NOT NULL,
+		PRIMARY KEY (allanime_id, episode_number)
+	);`
+
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("schema creation failed: %w", err)
+	}
+
+	if _, err := db.Exec(episodeSchema); err != nil {
+		return fmt.Errorf("episode schema creation failed: %w", err)
 	}
 
 	// Migrate old data if anime_progress table exists
 	migrateOldData(db)
 
 	indexes := []string{
-		`CREATE INDEX IF NOT EXISTS idx_media_lookup 
+		`CREATE INDEX IF NOT EXISTS idx_media_lookup
 		ON media_progress(allanime_id, last_updated DESC)`,
-		`CREATE INDEX IF NOT EXISTS idx_media_type 
+		`CREATE INDEX IF NOT EXISTS idx_media_type
 		ON media_progress(media_type, last_updated DESC)`,
 	}
 
@@ -252,7 +276,7 @@ func migrateOldData(db *sql.DB) {
 	// Migrate data: for each allanime_id, keep the entry with highest playback_time
 	_, err = db.Exec(`
 		INSERT OR REPLACE INTO media_progress (allanime_id, anilist_id, episode_number, playback_time, duration, title, media_type, last_updated)
-		SELECT 
+		SELECT
 			allanime_id,
 			MAX(anilist_id),
 			episode_number,
@@ -280,24 +304,26 @@ func migrateOldData(db *sql.DB) {
 *────────────────────────────────────────────────────────────────────────────
 */
 type preparedStatements struct {
-	upsert *sql.Stmt
-	get    *sql.Stmt
-	all    *sql.Stmt
-	delete *sql.Stmt
+	upsert        *sql.Stmt
+	get           *sql.Stmt
+	all           *sql.Stmt
+	delete        *sql.Stmt
+	upsertEpisode *sql.Stmt
+	getEpisode    *sql.Stmt
 }
 
 func prepareStatements(db *sql.DB) (*preparedStatements, error) {
 	// New schema: allanime_id is the primary key (unique per content)
 	upsert, err := db.Prepare(`INSERT INTO media_progress (
 		allanime_id,
-		anilist_id, 
-		episode_number, 
-		playback_time, 
-		duration, 
+		anilist_id,
+		episode_number,
+		playback_time,
+		duration,
 		title,
 		media_type,
 		last_updated
-	) VALUES (?,?,?,?,?,?,?,?) 
+	) VALUES (?,?,?,?,?,?,?,?)
 	ON CONFLICT(allanime_id) DO UPDATE SET
 		anilist_id = CASE WHEN excluded.anilist_id > 0 THEN excluded.anilist_id ELSE media_progress.anilist_id END,
 		episode_number = excluded.episode_number,
@@ -312,45 +338,72 @@ func prepareStatements(db *sql.DB) (*preparedStatements, error) {
 	}
 
 	// Get by allanime_id only (works for both movies and anime)
-	get, err := db.Prepare(`SELECT 
-		episode_number, 
-		playback_time, 
-		duration, 
-		title, 
-		last_updated 
-	FROM media_progress 
+	get, err := db.Prepare(`SELECT
+		episode_number,
+		playback_time,
+		duration,
+		title,
+		last_updated
+	FROM media_progress
 	WHERE allanime_id = ?`)
 
 	if err != nil {
 		return nil, fmt.Errorf("get preparation failed: %w", err)
 	}
 
-	all, err := db.Prepare(`SELECT 
-		anilist_id, 
-		allanime_id, 
-		episode_number, 
-		playback_time, 
-		duration, 
-		title, 
-		last_updated 
+	all, err := db.Prepare(`SELECT
+		anilist_id,
+		allanime_id,
+		episode_number,
+		playback_time,
+		duration,
+		title,
+		last_updated
 	FROM media_progress`)
 
 	if err != nil {
 		return nil, fmt.Errorf("all preparation failed: %w", err)
 	}
 
-	delete, err := db.Prepare(`DELETE FROM media_progress 
+	delete, err := db.Prepare(`DELETE FROM media_progress
 		WHERE allanime_id = ?`)
 
 	if err != nil {
 		return nil, fmt.Errorf("delete preparation failed: %w", err)
 	}
 
+	upSertEpisode, err := db.Prepare(`INSERT INTO episode_tracking (
+		allanime_id,
+		episode_number,
+		watched,
+		media_type,
+		last_updated
+	) VALUES (?, ?, ?, ?, ?)
+	ON CONFLICT(allanime_id, episode_number) DO UPDATE SET
+		watched = excluded.watched,
+		media_type = excluded.media_type,
+		last_updated = excluded.last_updated`)
+
+	if err != nil {
+		return nil, fmt.Errorf("episode upsert preparation failed: %w", err)
+	}
+
+	getEpisode, err := db.Prepare(`
+		SELECT watched, last_updated, media_type FROM episode_tracking
+		WHERE allanime_id = ? AND episode_number = ?
+		`)
+
+	if err != nil {
+		return nil, fmt.Errorf("episode get preparation failed: %w", err)
+	}
+
 	return &preparedStatements{
-		upsert: upsert,
-		get:    get,
-		all:    all,
-		delete: delete,
+		upsert:        upsert,
+		get:           get,
+		all:           all,
+		delete:        delete,
+		upsertEpisode: upSertEpisode,
+		getEpisode:    getEpisode,
 	}, nil
 }
 
@@ -478,6 +531,66 @@ func (t *LocalTracker) GetAllAnime() ([]Anime, error) {
 func (t *LocalTracker) DeleteAnime(anilistID int, allanimeID string) error {
 	_, err := t.deletePS.Exec(allanimeID)
 	return err
+}
+
+// UpsertEpisode updates or inserts an episode tracking record
+func (t *LocalTracker) UpsertEpisode(ep EpisodeTracking) error {
+	if t == nil || t.db == nil || t.upsertEpisodePS == nil {
+		return ErrTrackerNotInited
+	}
+
+	// Validate essential fields
+	if ep.AllanimeID == "" {
+		return fmt.Errorf("allanimeID cannot be empty for episode tracking")
+	}
+	if ep.EpisodeNumber <= 0 {
+		return fmt.Errorf("episode number must be greater than 0 for episode tracking")
+	}
+
+	if ep.MediaType == "" {
+		ep.MediaType = "anime"
+	}
+
+	ep.LastUpdated = time.Now()
+
+	_, err := t.upsertEpisodePS.Exec(
+		ep.AllanimeID,
+		ep.EpisodeNumber,
+		ep.Watched,
+		ep.MediaType,
+		ep.LastUpdated.Unix(),
+	)
+	return err
+}
+
+// GetEpisode retrieves an episode tracking record by Allanime ID and episode number
+func (t *LocalTracker) GetEpisodeTracking(allanimeID string, episodeNumber int) (*EpisodeTracking, error) {
+	// Safety check for when tracker is not initialized
+	if t == nil || t.db == nil || t.getEpisodePS == nil {
+		return nil, ErrTrackerNotInited
+	}
+
+	// Validate essential fields
+	if allanimeID == "" {
+		return nil, fmt.Errorf("allanimeID cannot be empty for episode tracking")
+	}
+	if episodeNumber <= 0 {
+		return nil, fmt.Errorf("episode number must be greater than 0 for episode tracking")
+	}
+
+	var ep EpisodeTracking
+	var ts int64
+
+	err := t.getEpisodePS.QueryRow(allanimeID, episodeNumber).Scan(&ep.Watched, &ts, &ep.MediaType)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("episode get failed: %w", err)
+	}
+
+	ep.LastUpdated = time.Unix(ts, 0)
+	return &ep, nil
 }
 
 /*
