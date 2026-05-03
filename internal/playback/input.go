@@ -33,6 +33,8 @@ func GetUserInput(isMovie ...bool) string {
 			{"Previous episode", "p"},
 			{"Select episode", "e"},
 			{"Change anime", "c"},
+			{"Mark episode as watched", "mark"},
+			{"Mark episode as unwatched", "unmark"},
 			{"← Back", "back"},
 			{"Quit", "q"},
 		}
